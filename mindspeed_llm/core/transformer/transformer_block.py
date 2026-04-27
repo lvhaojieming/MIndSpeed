@@ -28,6 +28,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
 from megatron.core.transformer import build_module
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
@@ -38,11 +39,14 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnMaskType
 from mindspeed.core.pipeline_parallel.noop_layers.adaptor import NoopTransformerLayer
-from mindspeed.core.transformer.transformer_block import _get_layer_offset
 from mindspeed.core.tensor_parallel.comm_autograd_function import auto_grad_sync_gather_along_last_dim, \
     auto_grad_sync_gather_along_first_dim
 from mindspeed.core.transformer.transformer import norm_recompute_forward
 from mindspeed.model.transformer import should_recompute_norm
+from mindspeed_llm.training.progressive_block_freeze import (
+    get_current_rank_global_layer_ids,
+    is_enabled as is_progressive_block_freeze_enabled,
+)
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -161,9 +165,37 @@ def _transformer_block_build_layers(self):
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
     self.attention_layer_type = None
+    layer_offset = get_transformer_layer_offset(self.config)
 
-    def build_layer(layer_spec, layer_number):
-        global_layer_number = _get_layer_offset(args) + layer_number
+    if is_progressive_block_freeze_enabled(args):
+        global_layer_ids = get_current_rank_global_layer_ids(args)
+    else:
+        global_layer_ids = [layer_offset + i for i in range(len(self.submodules.layer_specs))]
+
+    if len(global_layer_ids) != len(self.submodules.layer_specs):
+        raise RuntimeError(
+            "TransformerBlock layer mapping size does not match layer specs: "
+            f"{len(global_layer_ids)} vs {len(self.submodules.layer_specs)}"
+        )
+
+    if is_progressive_block_freeze_enabled(args):
+        printed = getattr(args, "progressive_block_freeze_printed_layer_mapping", set())
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        vp_rank = mpu.get_virtual_pipeline_model_parallel_rank()
+        vp_rank = 0 if vp_rank is None else vp_rank
+        key = (pp_rank, vp_rank)
+        if key not in printed and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_data_parallel_rank() == 0:
+            print(
+                f"progressive block freeze layer mapping: PP{pp_rank} VP{vp_rank} "
+                f"owns global layers {global_layer_ids}",
+                flush=True,
+            )
+            printed.add(key)
+            setattr(args, "progressive_block_freeze_printed_layer_mapping", printed)
+
+    def build_layer(layer_spec, global_layer_id):
+        global_layer_number = global_layer_id + 1
+        layer_number = global_layer_number - layer_offset
         # For dense and moe mix
         if (
                 args.num_experts
@@ -200,8 +232,8 @@ def _transformer_block_build_layers(self):
     # offset is implicit in TransformerLayer
     self.layers = torch.nn.ModuleList(
         [
-            build_layer(layer_spec, i + 1)
-            for i, layer_spec in enumerate(self.submodules.layer_specs)
+            build_layer(layer_spec, global_layer_id)
+            for layer_spec, global_layer_id in zip(self.submodules.layer_specs, global_layer_ids)
         ]
     )
 

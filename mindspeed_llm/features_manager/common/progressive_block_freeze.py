@@ -25,6 +25,10 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
                            help='First global transformer block for generated windows.')
         group.add_argument('--progressive-block-freeze-window-stride', type=int, default=None,
                            help='Total stride used to generate subsequent windows. Defaults to window size.')
+        group.add_argument('--progressive-block-freeze-layer-mapping', type=str, default=None,
+                           help='Optional explicit PP layer mapping, for example '
+                                '"PP0:0,1,8,9;PP1:2,3,10,11". The first implementation only accepts '
+                                'Megatron native VP-compatible mappings.')
         group.add_argument('--progressive-block-freeze-loss-key', type=str, default=None,
                            help='Loss key used for plateau detection. Defaults to the first reduced train loss.')
         group.add_argument('--progressive-block-freeze-plateau-window-size', type=int, default=10,
@@ -102,6 +106,9 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
                     raise AssertionError(
                         '--progressive-block-freeze-window-stride must align to a full interleaved pipeline cycle.'
                     )
+        if getattr(args, "progressive_block_freeze_layer_mapping", None):
+            from mindspeed_llm.training.progressive_block_freeze import build_global_layer_to_owner
+            build_global_layer_to_owner(args)
         if args.progressive_block_freeze_plateau_window_size <= 0:
             raise AssertionError('--progressive-block-freeze-plateau-window-size must be greater than 0.')
         if args.progressive_block_freeze_threshold < 0:

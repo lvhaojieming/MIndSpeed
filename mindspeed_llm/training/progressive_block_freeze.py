@@ -30,6 +30,33 @@ def _get_total_layers(args):
     return int(args.num_layers)
 
 
+def _get_pp_size(args):
+    return int(getattr(args, "pipeline_model_parallel_size", 1))
+
+
+def _get_vp_size(args):
+    vp_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
+    if vp_size is not None:
+        return int(vp_size)
+
+    pp_size = _get_pp_size(args)
+    virtual_chunk_size = getattr(args, "num_layers_per_virtual_pipeline_stage", None)
+    if pp_size <= 1 or virtual_chunk_size is None:
+        return 1
+
+    total_layers = _get_total_layers(args)
+    layers_per_pp_rank = total_layers // pp_size
+    return layers_per_pp_rank // int(virtual_chunk_size)
+
+
+def _get_layers_per_virtual_chunk(args, total_layers=None):
+    total_layers = _get_total_layers(args) if total_layers is None else total_layers
+    pp_size = _get_pp_size(args)
+    vp_size = _get_vp_size(args)
+    layers_per_pp_rank = total_layers // pp_size
+    return layers_per_pp_rank // vp_size
+
+
 def _parse_stage_token(token):
     if "-" not in token:
         raise ValueError(
@@ -60,17 +87,110 @@ def _stage_display(stage):
 
 def _uses_interleaved_pipeline(args):
     return (
-        int(getattr(args, "pipeline_model_parallel_size", 1)) > 1
+        _get_pp_size(args) > 1
         and getattr(args, "virtual_pipeline_model_parallel_size", None) is not None
     )
 
 
 def _get_interleaved_cycle_size(args, total_layers):
-    pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
-    vp_size = int(getattr(args, "virtual_pipeline_model_parallel_size", 1))
+    return _get_pp_size(args) * _get_layers_per_virtual_chunk(args, total_layers)
+
+
+def _parse_layer_mapping(mapping):
+    parsed = {}
+    if not mapping:
+        return parsed
+    for pp_entry in mapping.split(";"):
+        pp_entry = pp_entry.strip()
+        if not pp_entry:
+            continue
+        pp_name, layers = pp_entry.split(":", 1)
+        pp_name = pp_name.strip().lower()
+        if not pp_name.startswith("pp"):
+            raise ValueError(f"Invalid layer mapping entry: {pp_entry}")
+        pp_rank = int(pp_name[2:])
+        parsed[pp_rank] = [int(item) for item in layers.split(",") if item.strip()]
+    return parsed
+
+
+def build_global_layer_to_owner(args):
+    total_layers = _get_total_layers(args)
+    pp_size = _get_pp_size(args)
+    vp_size = _get_vp_size(args)
+    if total_layers % pp_size != 0:
+        raise ValueError("num_layers must be divisible by pipeline_model_parallel_size.")
+
     layers_per_pp_rank = total_layers // pp_size
+    if layers_per_pp_rank % vp_size != 0:
+        raise ValueError("layers per pipeline rank must be divisible by virtual pipeline size.")
+
     layers_per_virtual_chunk = layers_per_pp_rank // vp_size
-    return pp_size * layers_per_virtual_chunk
+    total_layers_per_vp_rank = total_layers // vp_size
+    owner = {}
+    for vp_rank in range(vp_size):
+        for pp_rank in range(pp_size):
+            offset = vp_rank * total_layers_per_vp_rank + pp_rank * layers_per_virtual_chunk
+            for local_idx in range(layers_per_virtual_chunk):
+                global_layer_id = offset + local_idx
+                owner[global_layer_id] = (pp_rank, vp_rank, local_idx)
+
+    if sorted(owner) != list(range(total_layers)):
+        raise ValueError("native VP layer mapping has missing or duplicate layers.")
+
+    explicit_mapping = _parse_layer_mapping(
+        getattr(args, "progressive_block_freeze_layer_mapping", None)
+    )
+    if explicit_mapping:
+        explicit_owner = {}
+        for pp_rank, layers in explicit_mapping.items():
+            if pp_rank < 0 or pp_rank >= pp_size:
+                raise ValueError(f"Invalid PP rank in layer mapping: {pp_rank}")
+            for global_layer_id in layers:
+                if global_layer_id < 0 or global_layer_id >= total_layers:
+                    raise ValueError(f"Invalid global layer id in layer mapping: {global_layer_id}")
+                if global_layer_id in explicit_owner:
+                    raise ValueError(f"Duplicate global layer id in layer mapping: {global_layer_id}")
+                explicit_owner[global_layer_id] = pp_rank
+        missing = sorted(set(range(total_layers)) - set(explicit_owner))
+        if missing:
+            raise ValueError(f"Layer mapping is missing global layers: {missing}")
+
+        mismatches = [
+            (global_layer_id, explicit_owner[global_layer_id], owner[global_layer_id][0])
+            for global_layer_id in range(total_layers)
+            if explicit_owner[global_layer_id] != owner[global_layer_id][0]
+        ]
+        if mismatches:
+            raise ValueError(
+                "progressive block freeze only supports Megatron native VP-compatible "
+                f"layer mapping in the first implementation. Mismatches: {mismatches[:8]}"
+            )
+
+    return owner
+
+
+def build_layer_to_pp_rank_mapping(args):
+    owner = build_global_layer_to_owner(args)
+    pp_size = _get_pp_size(args)
+    mapping = {pp_rank: [] for pp_rank in range(pp_size)}
+    for global_layer_id in sorted(owner):
+        pp_rank, _, _ = owner[global_layer_id]
+        mapping[pp_rank].append(global_layer_id)
+    return mapping
+
+
+def get_current_rank_global_layer_ids(args):
+    owner = build_global_layer_to_owner(args)
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    vp_rank = mpu.get_virtual_pipeline_model_parallel_rank()
+    if vp_rank is None:
+        vp_rank = 0
+    local_layers = [
+        (local_idx, global_layer_id)
+        for global_layer_id, (owner_pp_rank, owner_vp_rank, local_idx) in owner.items()
+        if owner_pp_rank == pp_rank and owner_vp_rank == vp_rank
+    ]
+    return [global_layer_id for _, global_layer_id in sorted(local_layers)]
 
 
 def _validate_interleaved_stage_alignment(args, total_layers, stages):
