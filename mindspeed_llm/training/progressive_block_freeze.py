@@ -562,3 +562,7 @@ def rebuild_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None
         model, timers, no_wd_decay_cond, scale_lr_cond, lr_mult
     )
     return model, optimizer, opt_param_scheduler
+
+
+def rebuild_ddp_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None, lr_mult=1.0):
+    return rebuild_optimizer_scheduler(model, no_wd_decay_cond, scale_lr_cond, lr_mult)
