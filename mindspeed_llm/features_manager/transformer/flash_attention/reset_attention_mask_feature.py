@@ -54,8 +54,9 @@ class ResetAttentionMaskFeature(MindSpeedFeature):
                                              MindSpeedCPDotProductAttention)
                 if args.transformer_impl == 'transformer_engine':
                     if args.context_parallel_algo == "kvallgather_cp_algo":
-                        from mindspeed.te.pytorch.attention.dot_product_attention.dot_product_attention import \
-                            MindSpeedTEDotProductAttention
+                        from mindspeed_llm.te.pytorch.attention.dot_product_attention.te_cp_dot_product_attention import (
+                            MindSpeedTEDotProductAttention,
+                        )
                         patch_manager.register_patch(
                             'megatron.core.extensions.transformer_engine.TEDotProductAttention',
                             MindSpeedTEDotProductAttention)

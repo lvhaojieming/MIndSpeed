@@ -12,8 +12,16 @@ from megatron.core.utils import get_attr_wrapped_model
 from megatron.core.distributed.finalize_model_grads import _reshard_if_dtensor, _unshard_if_dtensor
 from megatron.training import get_args
 from mindspeed.core.tensor_parallel.tp_2d.group_api_2d import TPXCollectiveComm
-from mindspeed.core.optimizer.low_precision import finalize_model_grads as quant_finalize
 from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias
+
+try:
+    from mindspeed.core.optimizer.low_precision import finalize_model_grads as quant_finalize
+except ModuleNotFoundError as exc:
+    if exc.name != "mindspeed.core.optimizer.low_precision" and not exc.name.startswith(
+        "mindspeed.core.optimizer.low_precision."
+    ):
+        raise
+    quant_finalize = None
 
 
 def _get_main_grad_attr(param: torch.nn.Parameter, use_custom_fsdp: bool = False):

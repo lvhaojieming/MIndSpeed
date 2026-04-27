@@ -17,8 +17,8 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from mindspeed.core.transformer.flash_attention.generate_mask.generate_mask import get_attention_mask
-from mindspeed.te.pytorch.attention.dot_product_attention.utils import get_distributed_world_size
-from mindspeed.te.pytorch.attention.dot_product_attention.context_parallel import KVAllGatherCPStrategy
+from mindspeed_llm.te.pytorch.attention.dot_product_attention.utils import get_distributed_world_size
+from mindspeed_llm.te.pytorch.attention.dot_product_attention.context_parallel import KVAllGatherCPStrategy
 
 from mindspeed_llm.core.context_parallel.adaptor import CPDotProductAttention
 
@@ -304,3 +304,6 @@ class TECPDotProductAttention(torch.nn.Module):
             )
 
         return core_attn_out
+
+
+MindSpeedTEDotProductAttention = TECPDotProductAttention

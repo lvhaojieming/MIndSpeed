@@ -31,7 +31,7 @@ from scipy.linalg import hadamard
 from mindspeed_llm.core.tensor_parallel.layers import LinearNoTP
 from mindspeed_llm.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb_bshd_in_complex
 from mindspeed_llm.core.context_parallel.kvallgather_context_parallel import gather_from_sp_cp, permute_cp_shard
-from mindspeed.te.pytorch.attention.dot_product_attention.kvallgather_context_parallel import (
+from mindspeed_llm.te.pytorch.attention.dot_product_attention.kvallgather_context_parallel import (
     get_distributed_world_size,
     get_seq_chunk_ids_for_reordering_before_attn,
 )

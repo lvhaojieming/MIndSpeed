@@ -77,7 +77,7 @@ class TransformerEngineBasicFeature(MindSpeedFeature):
             pm.register_patch('megatron.core.extensions.transformer_engine.TERowParallelGroupedLinear',
                                 MindSpeedTEPerformanceRowParallelGroupedLinear)
         if getattr(args, "fp8_format", False):
-            from mindspeed.te.pytorch.attention.dot_product_attention.dot_product_attention import \
+            from mindspeed_llm.te.pytorch.attention.dot_product_attention.te_cp_dot_product_attention import \
                 MindSpeedTEDotProductAttention
             from mindspeed.te.pytorch.module.layernorm_column_parallel_linear import \
                 MindSpeedTELayerNormColumnParallelLinear
@@ -132,7 +132,7 @@ class TransformerEngineBasicFeature(MindSpeedFeature):
                 from mindspeed.features_manager.megatron_basic.transformer_engine_basic import init_weight_quantization_reuse
                 init_weight_quantization_reuse(pm, args)
         else:
-            from mindspeed.te.pytorch.attention.dot_product_attention.dot_product_attention import \
+            from mindspeed_llm.te.pytorch.attention.dot_product_attention.te_cp_dot_product_attention import \
                 MindSpeedTEDotProductAttention
             from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
             from mindspeed.te.pytorch.module.layernorm_column_parallel_linear import \

@@ -24,11 +24,9 @@ from mindspeed.features_manager import (
     VirtualOptimizerFeature,
     HcclBufferAdaptiveFeature,
     HcclBufferSetFeature,
-    HcclOpModeSetFeature,
     RecomputeNormFeature,
     RecomputeActivationFeature,
     NPUDeterministicFeature,
-    NPUDataDumpFeature,
     EnableRecomputeLayersPerPPRank,
     RecomputeMethodFeature,
     SmartSwapFeature,
@@ -38,10 +36,27 @@ from mindspeed.features_manager import (
     ProfilerDefaultFeature,
     OptimizeP2PCommFeature,
     FusionAttentionV2Feature,
-    MoEAlltoAllMC2Feature
 )
 from mindspeed.features_manager.feature import MindSpeedFeature
 from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
+
+def _optional_core_feature(class_name, feature_name):
+    try:
+        from mindspeed import features_manager
+        return getattr(features_manager, class_name)
+    except AttributeError:
+        class OptionalCoreFeature(MindSpeedFeature):
+            def __init__(self):
+                super().__init__(feature_name=feature_name, optimization_level=0)
+
+        OptionalCoreFeature.__name__ = class_name
+        return OptionalCoreFeature
+
+
+HcclOpModeSetFeature = _optional_core_feature("HcclOpModeSetFeature", "hccl-op-mode-set")
+NPUDataDumpFeature = _optional_core_feature("NPUDataDumpFeature", "npu-data-dump")
+MoEAlltoAllMC2Feature = _optional_core_feature("MoEAlltoAllMC2Feature", "moe-alltoall-mc2")
+
 
 from mindspeed_llm.features_manager.low_precision.low_precision_optimizer_feature import LowPrecisionOptimizerFeature
 from mindspeed_llm.features_manager.affinity.affinity import AffinityFeature
