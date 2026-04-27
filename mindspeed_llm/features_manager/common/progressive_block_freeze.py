@@ -16,12 +16,13 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
         group.add_argument('--progressive-block-freeze', action='store_true', default=False,
                            help='Enable progressive strict freezing of transformer block windows.')
         group.add_argument('--progressive-block-freeze-stages', type=str, default=None,
-                           help='Comma separated contiguous block ranges, end-exclusive. Example: 0-8,8-16.')
+                           help='Comma separated global block ranges, end-exclusive. With interleaved pipeline '
+                                'parallelism, Megatron virtual pipeline ownership balances these ranges across '
+                                'pipeline ranks. Example: 0-8,8-16.')
         group.add_argument('--progressive-block-freeze-window-size', type=int, default=None,
-                           help='Total active transformer block window size. Generated windows are evenly '
-                                'distributed across pipeline ranks when pipeline parallelism is enabled.')
+                           help='Global active transformer block window size.')
         group.add_argument('--progressive-block-freeze-start-block', type=int, default=0,
-                           help='First local transformer block offset for generated pipeline-balanced windows.')
+                           help='First global transformer block for generated windows.')
         group.add_argument('--progressive-block-freeze-window-stride', type=int, default=None,
                            help='Total stride used to generate subsequent windows. Defaults to window size.')
         group.add_argument('--progressive-block-freeze-loss-key', type=str, default=None,
@@ -40,8 +41,10 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
     def validate_args(self, args):
         if not args.progressive_block_freeze:
             return
-        if getattr(args, "use_custom_fsdp", False) and getattr(args, "tensor_model_parallel_size", 1) > 1:
-            raise AssertionError('progressive-block-freeze with custom FSDP does not support tensor parallelism.')
+        if getattr(args, "use_custom_fsdp", False) or getattr(args, "use_torch_fsdp2", False):
+            raise AssertionError('progressive-block-freeze supports Megatron DDP only.')
+        if not getattr(args, "use_distributed_optimizer", False):
+            raise AssertionError('progressive-block-freeze requires --use-distributed-optimizer.')
         if getattr(args, "enable_high_availability", False):
             raise AssertionError('progressive-block-freeze does not support the high availability training loop.')
         if getattr(args, "lora_target_modules", None):
@@ -58,16 +61,34 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
         if args.progressive_block_freeze_window_stride is not None and args.progressive_block_freeze_window_stride <= 0:
             raise AssertionError('--progressive-block-freeze-window-stride must be greater than 0.')
         pp_size = getattr(args, "pipeline_model_parallel_size", 1)
-        if args.progressive_block_freeze_stages is None and pp_size > 1:
-            if args.progressive_block_freeze_window_size % pp_size != 0:
+        if pp_size > 1:
+            virtual_chunk_size = getattr(args, "num_layers_per_virtual_pipeline_stage", None)
+            if virtual_chunk_size is None:
                 raise AssertionError(
-                    '--progressive-block-freeze-window-size must be divisible by pipeline-model-parallel-size.'
+                    'progressive-block-freeze with pipeline parallelism requires '
+                    '--num-layers-per-virtual-pipeline-stage for interleaved pipeline ownership.'
                 )
-            stride = args.progressive_block_freeze_window_stride or args.progressive_block_freeze_window_size
-            if stride % pp_size != 0:
-                raise AssertionError(
-                    '--progressive-block-freeze-window-stride must be divisible by pipeline-model-parallel-size.'
-                )
+            interleaved_cycle_size = pp_size * virtual_chunk_size
+            if args.progressive_block_freeze_stages is not None:
+                for item in args.progressive_block_freeze_stages.split(","):
+                    if not item.strip():
+                        continue
+                    start, end = item.strip().split("-", 1)
+                    if int(start) % interleaved_cycle_size != 0 or int(end) % interleaved_cycle_size != 0:
+                        raise AssertionError(
+                            '--progressive-block-freeze-stages range starts and ends must align to a full '
+                            'interleaved pipeline cycle.'
+                        )
+            else:
+                stride = args.progressive_block_freeze_window_stride or args.progressive_block_freeze_window_size
+                if args.progressive_block_freeze_window_size % interleaved_cycle_size != 0:
+                    raise AssertionError(
+                        '--progressive-block-freeze-window-size must align to a full interleaved pipeline cycle.'
+                    )
+                if stride % interleaved_cycle_size != 0:
+                    raise AssertionError(
+                        '--progressive-block-freeze-window-stride must align to a full interleaved pipeline cycle.'
+                    )
         if args.progressive_block_freeze_plateau_window_size <= 0:
             raise AssertionError('--progressive-block-freeze-plateau-window-size must be greater than 0.')
         if args.progressive_block_freeze_threshold < 0:

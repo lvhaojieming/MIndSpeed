@@ -9,21 +9,12 @@ import torch
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
 from megatron.core.utils import get_model_config
 from megatron.training import get_args, get_timers
 from megatron.training.training import get_optimizer_param_scheduler
 from megatron.training.utils import print_rank_0
-
-try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-    HAVE_FSDP2 = True
-except ImportError:
-    torch_FSDP = None
-    HAVE_FSDP2 = False
-
 
 FREEZE_STATE_KEY = "freeze_state"
 
@@ -67,6 +58,34 @@ def _stage_display(stage):
     return ",".join(f"[{start}, {end})" for start, end in _stage_ranges(stage))
 
 
+def _uses_interleaved_pipeline(args):
+    return (
+        int(getattr(args, "pipeline_model_parallel_size", 1)) > 1
+        and getattr(args, "virtual_pipeline_model_parallel_size", None) is not None
+    )
+
+
+def _get_interleaved_cycle_size(args, total_layers):
+    pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
+    vp_size = int(getattr(args, "virtual_pipeline_model_parallel_size", 1))
+    layers_per_pp_rank = total_layers // pp_size
+    layers_per_virtual_chunk = layers_per_pp_rank // vp_size
+    return pp_size * layers_per_virtual_chunk
+
+
+def _validate_interleaved_stage_alignment(args, total_layers, stages):
+    if not _uses_interleaved_pipeline(args):
+        return
+    cycle_size = _get_interleaved_cycle_size(args, total_layers)
+    for stage in stages:
+        for start, end in _stage_ranges(stage):
+            if start % cycle_size != 0 or end % cycle_size != 0:
+                raise ValueError(
+                    "progressive block freeze stage ranges must align to a full interleaved "
+                    f"pipeline cycle of {cycle_size} blocks."
+                )
+
+
 def _get_pipeline_layer_bounds(args, total_layers):
     num_layer_list = getattr(args, "num_layer_list", None)
     if num_layer_list:
@@ -92,19 +111,18 @@ def _get_pipeline_layer_bounds(args, total_layers):
 
 
 def _build_pipeline_balanced_stages(args, total_layers):
-    pp_bounds = _get_pipeline_layer_bounds(args, total_layers)
-    pp_size = len(pp_bounds)
     window_size = int(args.progressive_block_freeze_window_size)
     stride = int(args.progressive_block_freeze_window_stride or window_size)
     start = int(args.progressive_block_freeze_start_block)
-
-    if pp_size <= 1:
+    if _uses_interleaved_pipeline(args) or int(getattr(args, "pipeline_model_parallel_size", 1)) <= 1:
         stages = []
         while start < total_layers:
             stages.append((start, min(start + window_size, total_layers)))
             start += stride
         return stages
 
+    pp_bounds = _get_pipeline_layer_bounds(args, total_layers)
+    pp_size = len(pp_bounds)
     if window_size % pp_size != 0:
         raise ValueError(
             "--progressive-block-freeze-window-size must be divisible by pipeline_model_parallel_size "
@@ -134,16 +152,45 @@ def _build_pipeline_balanced_stages(args, total_layers):
     return stages
 
 
+def _expand_pipeline_balanced_stage(args, total_layers, start, end):
+    if _uses_interleaved_pipeline(args):
+        return (start, end)
+
+    pp_bounds = _get_pipeline_layer_bounds(args, total_layers)
+    pp_size = len(pp_bounds)
+    if pp_size <= 1:
+        return (start, end)
+    if start % pp_size != 0 or end % pp_size != 0:
+        raise ValueError(
+            "--progressive-block-freeze-stages ranges must have start and end divisible by "
+            "pipeline_model_parallel_size when stages are distributed across pipeline ranks."
+        )
+
+    local_start = start // pp_size
+    local_end = end // pp_size
+    ranges = []
+    for pp_start, pp_end in pp_bounds:
+        global_start = pp_start + local_start
+        global_end = min(pp_start + local_end, pp_end)
+        if global_start < pp_end and global_start < global_end:
+            ranges.append((global_start, global_end))
+    if not ranges:
+        raise ValueError(f"Progressive block freeze stage [{start}, {end}) generated no pipeline ranges.")
+    return ranges
+
+
 def build_stages(args):
     total_layers = _get_total_layers(args)
     if getattr(args, "progressive_block_freeze_stages", None):
         stages = [
-            _parse_stage_token(token.strip())
+            _expand_pipeline_balanced_stage(args, total_layers, *_parse_stage_token(token.strip()))
             for token in args.progressive_block_freeze_stages.split(",")
             if token.strip()
         ]
     else:
         stages = _build_pipeline_balanced_stages(args, total_layers)
+
+    _validate_interleaved_stage_alignment(args, total_layers, stages)
 
     if not stages:
         raise ValueError("progressive block freeze generated no stages.")
@@ -199,7 +246,7 @@ args.freeze_state = {
     "stage_idx": 2,
     "active_start": 16,
     "active_end": 24,
-    "active_ranges": [(16, 18), (24, 26), (32, 34), (40, 42)],
+    "active_ranges": [(16, 24)],
     "block_enter_iteration": 5000,
     "plateau_hits": 1,
     "recent_loss_history": [2.31, 2.28, 2.27],
@@ -226,8 +273,16 @@ def load_state_dict(state, args=None):
     args = args if args is not None else get_args()
     if state is None:
         return
-    setattr(args, FREEZE_STATE_KEY, deepcopy(state))
+    state = deepcopy(state)
+    if state.get("active_ranges") is None:
+        stages = build_stages(args)
+        stage_idx = int(state.get("stage_idx", 0))
+        if 0 <= stage_idx < len(stages):
+            _set_active_stage(state, stages[stage_idx])
+        elif "active_start" in state and "active_end" in state:
+            state["active_ranges"] = [(int(state["active_start"]), int(state["active_end"]))]
     setattr(args, "progressive_block_freeze_loaded", True)
+    setattr(args, FREEZE_STATE_KEY, state)
 
 
 def _iter_transformer_blocks(model):
@@ -369,17 +424,12 @@ def _model_chunks(model):
 
 def _unwrap_data_parallel(model):
     chunks = []
-    rewrappable_wrappers = (DDP, custom_FSDP)
     for model_chunk in _model_chunks(model):
-        if isinstance(model_chunk, rewrappable_wrappers):
+        if isinstance(model_chunk, DDP):
             chunks.append(model_chunk.module)
         else:
             chunks.append(model_chunk)
     return chunks
-
-
-def _is_torch_fsdp2_chunk(model_chunk):
-    return HAVE_FSDP2 and isinstance(model_chunk, torch_FSDP)
 
 
 def _build_ddp_config(args, num_parameters):
@@ -400,17 +450,14 @@ def _build_ddp_config(args, num_parameters):
         kwargs['bucket_size'] = args.ddp_bucket_size
     kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
     kwargs['average_in_collective'] = args.ddp_average_in_collective
-    if getattr(args, "use_custom_fsdp", False) and getattr(args, "use_precision_aware_optimizer", False):
-        kwargs["preserve_fp32_weights"] = False
 
     ddp_config = DistributedDataParallelConfig(**kwargs)
-    if not getattr(args, "use_torch_fsdp2", False):
-        if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(
-                40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
-            )
-        if not ddp_config.overlap_grad_reduce:
-            ddp_config.bucket_size = None
+    if ddp_config.bucket_size is None:
+        ddp_config.bucket_size = max(
+            40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        )
+    if not ddp_config.overlap_grad_reduce:
+        ddp_config.bucket_size = None
     return ddp_config
 
 
@@ -440,40 +487,24 @@ def rebuild_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None
     args = get_args()
     timers = get_timers()
 
-    if getattr(args, "use_torch_fsdp2", False):
-        if not HAVE_FSDP2:
-            raise RuntimeError("Torch FSDP2 requires torch>=2.4.0.")
-        model = _model_chunks(model)
-        if not all(_is_torch_fsdp2_chunk(model_module) for model_module in model):
-            raise RuntimeError("progressive block freeze expected Torch FSDP2 wrapped model chunks.")
-        apply_freeze(model, args)
-        for model_module in model:
-            for param in model_module.parameters():
-                set_defaults_if_not_set_tensor_model_parallel_attributes(param)
-        num_parameters = sum(sum(param.nelement() for param in model_module.parameters()) for model_module in model)
-        ddp_config = _build_ddp_config(args, num_parameters)
-        for model_module in model:
-            model_module.ddp_config = ddp_config
-        optimizer, opt_param_scheduler = _build_optimizer_scheduler(
-            model, timers, no_wd_decay_cond, scale_lr_cond, lr_mult
-        )
-        return model, optimizer, opt_param_scheduler
+    if getattr(args, "use_custom_fsdp", False) or getattr(args, "use_torch_fsdp2", False):
+        raise RuntimeError("progressive block freeze optimizer rebuild supports Megatron DDP only.")
+    if not getattr(args, "use_distributed_optimizer", False):
+        raise RuntimeError("progressive block freeze requires Megatron distributed optimizer.")
 
     model = _unwrap_data_parallel(model)
     apply_freeze(model, args)
 
-    if not getattr(args, "use_custom_fsdp", False):
-        for model_module in model:
-            for param in model_module.parameters():
-                set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+    for model_module in model:
+        for param in model_module.parameters():
+            set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     num_parameters = sum(sum(param.nelement() for param in model_module.parameters()) for model_module in model)
     config = get_model_config(model[0])
     ddp_config = _build_ddp_config(args, num_parameters)
-    DP = custom_FSDP if getattr(args, "use_custom_fsdp", False) else DDP
 
     model = [
-        DP(
+        DDP(
             config=config,
             ddp_config=ddp_config,
             module=model_chunk,
@@ -489,7 +520,3 @@ def rebuild_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None
         model, timers, no_wd_decay_cond, scale_lr_cond, lr_mult
     )
     return model, optimizer, opt_param_scheduler
-
-
-def rebuild_ddp_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None, lr_mult=1.0):
-    return rebuild_optimizer_scheduler(model, no_wd_decay_cond, scale_lr_cond, lr_mult)
