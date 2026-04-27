@@ -62,6 +62,19 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
             raise AssertionError('--progressive-block-freeze-window-stride must be greater than 0.')
         pp_size = getattr(args, "pipeline_model_parallel_size", 1)
         if pp_size > 1:
+            if getattr(args, "num_layer_list", None):
+                raise AssertionError(
+                    'progressive-block-freeze with pipeline parallelism requires Megatron native uniform '
+                    'virtual pipeline layout and does not support --num-layer-list.'
+                )
+            if (
+                getattr(args, "decoder_first_pipeline_num_layers", None) is not None
+                or getattr(args, "decoder_last_pipeline_num_layers", None) is not None
+            ):
+                raise AssertionError(
+                    'progressive-block-freeze with pipeline parallelism does not support uneven first/last '
+                    'pipeline layer counts.'
+                )
             virtual_chunk_size = getattr(args, "num_layers_per_virtual_pipeline_stage", None)
             if virtual_chunk_size is None:
                 raise AssertionError(

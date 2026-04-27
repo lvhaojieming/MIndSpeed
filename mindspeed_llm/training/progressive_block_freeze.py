@@ -86,109 +86,27 @@ def _validate_interleaved_stage_alignment(args, total_layers, stages):
                 )
 
 
-def _get_pipeline_layer_bounds(args, total_layers):
-    num_layer_list = getattr(args, "num_layer_list", None)
-    if num_layer_list:
-        bounds = []
-        start = 0
-        for item in num_layer_list.split(","):
-            end = start + int(item)
-            bounds.append((start, end))
-            start = end
-        return bounds
-
-    pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
-    base_layers = total_layers // pp_size
-    remainder = total_layers % pp_size
-    bounds = []
-    start = 0
-    for pp_rank in range(pp_size):
-        local_layers = base_layers + (1 if pp_rank < remainder else 0)
-        end = start + local_layers
-        bounds.append((start, end))
-        start = end
-    return bounds
-
-
-def _build_pipeline_balanced_stages(args, total_layers):
+def _build_global_stages(args, total_layers):
     window_size = int(args.progressive_block_freeze_window_size)
     stride = int(args.progressive_block_freeze_window_stride or window_size)
     start = int(args.progressive_block_freeze_start_block)
-    if _uses_interleaved_pipeline(args) or int(getattr(args, "pipeline_model_parallel_size", 1)) <= 1:
-        stages = []
-        while start < total_layers:
-            stages.append((start, min(start + window_size, total_layers)))
-            start += stride
-        return stages
-
-    pp_bounds = _get_pipeline_layer_bounds(args, total_layers)
-    pp_size = len(pp_bounds)
-    if window_size % pp_size != 0:
-        raise ValueError(
-            "--progressive-block-freeze-window-size must be divisible by pipeline_model_parallel_size "
-            "when generated stages are distributed across pipeline ranks."
-        )
-    if stride % pp_size != 0:
-        raise ValueError(
-            "--progressive-block-freeze-window-stride must be divisible by pipeline_model_parallel_size "
-            "when generated stages are distributed across pipeline ranks."
-        )
-
-    local_window_size = window_size // pp_size
-    local_stride = stride // pp_size
-    local_start = start
-    max_local_layers = max(end - start for start, end in pp_bounds)
     stages = []
-    while local_start < max_local_layers:
-        ranges = []
-        for pp_start, pp_end in pp_bounds:
-            start = pp_start + local_start
-            end = min(start + local_window_size, pp_end)
-            if start < pp_end:
-                ranges.append((start, end))
-        if ranges:
-            stages.append(ranges)
-        local_start += local_stride
+    while start < total_layers:
+        stages.append((start, min(start + window_size, total_layers)))
+        start += stride
     return stages
-
-
-def _expand_pipeline_balanced_stage(args, total_layers, start, end):
-    if _uses_interleaved_pipeline(args):
-        return (start, end)
-
-    pp_bounds = _get_pipeline_layer_bounds(args, total_layers)
-    pp_size = len(pp_bounds)
-    if pp_size <= 1:
-        return (start, end)
-    if start % pp_size != 0 or end % pp_size != 0:
-        raise ValueError(
-            "--progressive-block-freeze-stages ranges must have start and end divisible by "
-            "pipeline_model_parallel_size when stages are distributed across pipeline ranks."
-        )
-
-    local_start = start // pp_size
-    local_end = end // pp_size
-    ranges = []
-    for pp_start, pp_end in pp_bounds:
-        global_start = pp_start + local_start
-        global_end = min(pp_start + local_end, pp_end)
-        if global_start < pp_end and global_start < global_end:
-            ranges.append((global_start, global_end))
-    if not ranges:
-        raise ValueError(f"Progressive block freeze stage [{start}, {end}) generated no pipeline ranges.")
-    return ranges
 
 
 def build_stages(args):
     total_layers = _get_total_layers(args)
     if getattr(args, "progressive_block_freeze_stages", None):
         stages = [
-            _expand_pipeline_balanced_stage(args, total_layers, *_parse_stage_token(token.strip()))
+            _parse_stage_token(token.strip())
             for token in args.progressive_block_freeze_stages.split(",")
             if token.strip()
         ]
     else:
-        stages = _build_pipeline_balanced_stages(args, total_layers)
+        stages = _build_global_stages(args, total_layers)
 
     _validate_interleaved_stage_alignment(args, total_layers, stages)
 
