@@ -433,13 +433,19 @@ def _unwrap_data_parallel(model):
 
 
 def _build_ddp_config(args, num_parameters):
-    kwargs = {}
-    for field in dataclasses.fields(DistributedDataParallelConfig):
-        if hasattr(args, field.name):
-            kwargs[field.name] = getattr(args, field.name)
-    kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
-    kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
-    kwargs['check_for_large_grads'] = args.check_for_large_grads
+    kwargs = {
+        field.name: getattr(args, field.name)
+        for field in dataclasses.fields(DistributedDataParallelConfig)
+        if hasattr(args, field.name)
+    }
+    kwargs.update({
+        'grad_reduce_in_fp32': args.accumulate_allreduce_grads_in_fp32,
+        'check_for_nan_in_grad': args.check_for_nan_in_loss_and_grad,
+        'check_for_large_grads': args.check_for_large_grads,
+        'pad_buckets_for_high_nccl_busbw': args.ddp_pad_buckets_for_high_nccl_busbw,
+        'average_in_collective': args.ddp_average_in_collective,
+    })
+
     if args.ddp_num_buckets is not None:
         if args.ddp_bucket_size is not None:
             raise ValueError("Cannot specify both --ddp-num-buckets and --ddp-bucket-size")
@@ -448,8 +454,6 @@ def _build_ddp_config(args, num_parameters):
         kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
     else:
         kwargs['bucket_size'] = args.ddp_bucket_size
-    kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
-    kwargs['average_in_collective'] = args.ddp_average_in_collective
 
     ddp_config = DistributedDataParallelConfig(**kwargs)
     if ddp_config.bucket_size is None:
