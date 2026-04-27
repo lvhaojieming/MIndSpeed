@@ -51,7 +51,89 @@ def _parse_stage_token(token):
         raise ValueError(f"Invalid progressive block freeze stage range: {token}")
     return start, end
 
-# 这部分可以再优化修改一下
+
+def _stage_ranges(stage):
+    if isinstance(stage, tuple) and len(stage) == 2 and all(isinstance(item, int) for item in stage):
+        return [stage]
+    return [tuple(item) for item in stage]
+
+
+def _stage_bounds(stage):
+    ranges = _stage_ranges(stage)
+    return min(start for start, _ in ranges), max(end for _, end in ranges)
+
+
+def _stage_display(stage):
+    return ",".join(f"[{start}, {end})" for start, end in _stage_ranges(stage))
+
+
+def _get_pipeline_layer_bounds(args, total_layers):
+    num_layer_list = getattr(args, "num_layer_list", None)
+    if num_layer_list:
+        bounds = []
+        start = 0
+        for item in num_layer_list.split(","):
+            end = start + int(item)
+            bounds.append((start, end))
+            start = end
+        return bounds
+
+    pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
+    base_layers = total_layers // pp_size
+    remainder = total_layers % pp_size
+    bounds = []
+    start = 0
+    for pp_rank in range(pp_size):
+        local_layers = base_layers + (1 if pp_rank < remainder else 0)
+        end = start + local_layers
+        bounds.append((start, end))
+        start = end
+    return bounds
+
+
+def _build_pipeline_balanced_stages(args, total_layers):
+    pp_bounds = _get_pipeline_layer_bounds(args, total_layers)
+    pp_size = len(pp_bounds)
+    window_size = int(args.progressive_block_freeze_window_size)
+    stride = int(args.progressive_block_freeze_window_stride or window_size)
+    start = int(args.progressive_block_freeze_start_block)
+
+    if pp_size <= 1:
+        stages = []
+        while start < total_layers:
+            stages.append((start, min(start + window_size, total_layers)))
+            start += stride
+        return stages
+
+    if window_size % pp_size != 0:
+        raise ValueError(
+            "--progressive-block-freeze-window-size must be divisible by pipeline_model_parallel_size "
+            "when generated stages are distributed across pipeline ranks."
+        )
+    if stride % pp_size != 0:
+        raise ValueError(
+            "--progressive-block-freeze-window-stride must be divisible by pipeline_model_parallel_size "
+            "when generated stages are distributed across pipeline ranks."
+        )
+
+    local_window_size = window_size // pp_size
+    local_stride = stride // pp_size
+    local_start = start
+    max_local_layers = max(end - start for start, end in pp_bounds)
+    stages = []
+    while local_start < max_local_layers:
+        ranges = []
+        for pp_start, pp_end in pp_bounds:
+            start = pp_start + local_start
+            end = min(start + local_window_size, pp_end)
+            if start < pp_end:
+                ranges.append((start, end))
+        if ranges:
+            stages.append(ranges)
+        local_start += local_stride
+    return stages
+
+
 def build_stages(args):
     total_layers = _get_total_layers(args)
     if getattr(args, "progressive_block_freeze_stages", None):
@@ -61,40 +143,52 @@ def build_stages(args):
             if token.strip()
         ]
     else:
-        window_size = args.progressive_block_freeze_window_size
-        stride = args.progressive_block_freeze_window_stride or window_size
-        stages = []
-        start = args.progressive_block_freeze_start_block
-        while start < total_layers:
-            stages.append((start, min(start + window_size, total_layers)))
-            start += stride
+        stages = _build_pipeline_balanced_stages(args, total_layers)
 
     if not stages:
         raise ValueError("progressive block freeze generated no stages.")
+    seen_ranges = []
+    for stage in stages:
+        stage_ranges = sorted(_stage_ranges(stage))
+        prev_end = None
+        for start, end in stage_ranges:
+            if start < 0 or end <= start:
+                raise ValueError(f"Invalid progressive block freeze stage range: [{start}, {end})")
+            if end > total_layers:
+                raise ValueError(
+                    f"Progressive block freeze stage [{start}, {end}) exceeds num_layers={total_layers}."
+                )
+            if prev_end is not None and start < prev_end:
+                raise ValueError("Progressive block freeze ranges in the same stage must not overlap.")
+            prev_end = end
+            seen_ranges.append((start, end))
     prev_end = None
-    for start, end in stages:
-        if end > total_layers:
-            raise ValueError(
-                f"Progressive block freeze stage [{start}, {end}) exceeds num_layers={total_layers}."
-            )
+    for start, end in sorted(seen_ranges):
         if prev_end is not None and start < prev_end:
             raise ValueError("Progressive block freeze stages must not overlap.")
         prev_end = end
     return stages
 
+
+def _set_active_stage(state, stage):
+    active_start, active_end = _stage_bounds(stage)
+    state["active_start"] = active_start
+    state["active_end"] = active_end
+    state["active_ranges"] = _stage_ranges(stage)
+
+
 # 初始化训练stage
 def init_state(args, iteration=0):
     stages = build_stages(args)
-    active_start, active_end = stages[0]
-    return {
+    state = {
         "stage_idx": 0,
-        "active_start": active_start,
-        "active_end": active_end,
         "block_enter_iteration": int(iteration),
         "plateau_hits": 0,
         "recent_loss_history": [],
         "last_switch_reason": "init",
     }
+    _set_active_stage(state, stages[0])
+    return state
 
 # 重点函数确定当前stage的状态（debug的重点位置）
 """
@@ -105,6 +199,7 @@ args.freeze_state = {
     "stage_idx": 2,
     "active_start": 16,
     "active_end": 24,
+    "active_ranges": [(16, 18), (24, 26), (32, 34), (40, 42)],
     "block_enter_iteration": 5000,
     "plateau_hits": 1,
     "recent_loss_history": [2.31, 2.28, 2.27],
@@ -154,8 +249,9 @@ def apply_freeze(model, args=None):
         return
 
     state = ensure_state(args)
-    active_start = int(state["active_start"])
-    active_end = int(state["active_end"])
+    active_ranges = state.get("active_ranges")
+    if active_ranges is None:
+        active_ranges = [(int(state["active_start"]), int(state["active_end"]))]
     active_blocks = 0
     active_params = 0
 
@@ -164,7 +260,7 @@ def apply_freeze(model, args=None):
             param.requires_grad = False
 
     for global_idx, layer in _iter_transformer_blocks(model):
-        trainable = active_start <= global_idx < active_end
+        trainable = any(start <= global_idx < end for start, end in active_ranges)
         if trainable:
             active_blocks += 1
         for param in layer.parameters(recurse=True):
@@ -177,17 +273,17 @@ def apply_freeze(model, args=None):
         torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
         if count.item() == 0:
             raise RuntimeError(
-                f"Progressive block freeze active window [{active_start}, {active_end}) "
+                f"Progressive block freeze active ranges {_stage_display(active_ranges)} "
                 "did not match any local/global transformer blocks."
             )
     elif active_blocks == 0:
         raise RuntimeError(
-            f"Progressive block freeze active window [{active_start}, {active_end}) "
+            f"Progressive block freeze active ranges {_stage_display(active_ranges)} "
             "did not match any transformer blocks."
         )
 
     print_rank_0(
-        f"progressive block freeze active blocks [{active_start}, {active_end}), "
+        f"progressive block freeze active blocks {_stage_display(active_ranges)}, "
         f"local active blocks {active_blocks}, local active params {active_params}"
     )
 
@@ -254,17 +350,16 @@ def maybe_advance(loss_dict, iteration, skipped_iter, args=None):
 
 def _switch_to_next_stage(state, stages, iteration, reason):
     next_stage = int(state["stage_idx"]) + 1
-    active_start, active_end = stages[next_stage]
+    stage = stages[next_stage]
     state["stage_idx"] = next_stage
-    state["active_start"] = active_start
-    state["active_end"] = active_end
+    _set_active_stage(state, stage)
     state["block_enter_iteration"] = int(iteration)
     state["plateau_hits"] = 0
     state["recent_loss_history"] = []
     state["last_switch_reason"] = reason
     print_rank_0(
         f"progressive block freeze switches to stage {next_stage} "
-        f"[{active_start}, {active_end}) at iteration {iteration}, reason={reason}"
+        f"{_stage_display(stage)} at iteration {iteration}, reason={reason}"
     )
 
 

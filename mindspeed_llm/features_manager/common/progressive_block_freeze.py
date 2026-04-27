@@ -18,11 +18,12 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
         group.add_argument('--progressive-block-freeze-stages', type=str, default=None,
                            help='Comma separated contiguous block ranges, end-exclusive. Example: 0-8,8-16.')
         group.add_argument('--progressive-block-freeze-window-size', type=int, default=None,
-                           help='Contiguous active transformer block window size.')
+                           help='Total active transformer block window size. Generated windows are evenly '
+                                'distributed across pipeline ranks when pipeline parallelism is enabled.')
         group.add_argument('--progressive-block-freeze-start-block', type=int, default=0,
-                           help='First global transformer block index for generated windows.')
+                           help='First local transformer block offset for generated pipeline-balanced windows.')
         group.add_argument('--progressive-block-freeze-window-stride', type=int, default=None,
-                           help='Stride used to generate subsequent windows. Defaults to window size.')
+                           help='Total stride used to generate subsequent windows. Defaults to window size.')
         group.add_argument('--progressive-block-freeze-loss-key', type=str, default=None,
                            help='Loss key used for plateau detection. Defaults to the first reduced train loss.')
         group.add_argument('--progressive-block-freeze-plateau-window-size', type=int, default=10,
@@ -56,6 +57,17 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
             raise AssertionError('--progressive-block-freeze-window-size must be greater than 0.')
         if args.progressive_block_freeze_window_stride is not None and args.progressive_block_freeze_window_stride <= 0:
             raise AssertionError('--progressive-block-freeze-window-stride must be greater than 0.')
+        pp_size = getattr(args, "pipeline_model_parallel_size", 1)
+        if args.progressive_block_freeze_stages is None and pp_size > 1:
+            if args.progressive_block_freeze_window_size % pp_size != 0:
+                raise AssertionError(
+                    '--progressive-block-freeze-window-size must be divisible by pipeline-model-parallel-size.'
+                )
+            stride = args.progressive_block_freeze_window_stride or args.progressive_block_freeze_window_size
+            if stride % pp_size != 0:
+                raise AssertionError(
+                    '--progressive-block-freeze-window-stride must be divisible by pipeline-model-parallel-size.'
+                )
         if args.progressive_block_freeze_plateau_window_size <= 0:
             raise AssertionError('--progressive-block-freeze-plateau-window-size must be greater than 0.')
         if args.progressive_block_freeze_threshold < 0:
