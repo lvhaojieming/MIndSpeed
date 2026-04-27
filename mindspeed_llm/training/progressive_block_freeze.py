@@ -9,12 +9,20 @@ import torch
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
 from megatron.core.utils import get_model_config
 from megatron.training import get_args, get_timers
 from megatron.training.training import get_optimizer_param_scheduler
 from megatron.training.utils import print_rank_0
+
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+    HAVE_FSDP2 = True
+except ImportError:
+    torch_FSDP = None
+    HAVE_FSDP2 = False
 
 
 FREEZE_STATE_KEY = "freeze_state"
@@ -43,7 +51,7 @@ def _parse_stage_token(token):
         raise ValueError(f"Invalid progressive block freeze stage range: {token}")
     return start, end
 
-
+# 这部分可以再优化修改一下
 def build_stages(args):
     total_layers = _get_total_layers(args)
     if getattr(args, "progressive_block_freeze_stages", None):
@@ -74,7 +82,7 @@ def build_stages(args):
         prev_end = end
     return stages
 
-
+# 初始化训练stage
 def init_state(args, iteration=0):
     stages = build_stages(args)
     active_start, active_end = stages[0]
@@ -88,7 +96,22 @@ def init_state(args, iteration=0):
         "last_switch_reason": "init",
     }
 
+# 重点函数确定当前stage的状态（debug的重点位置）
+"""
+训练中args维持一个全局变量查看当前的状态,包含当前训练stage的完整信息
+args.freeze_state
 
+args.freeze_state = {
+    "stage_idx": 2,
+    "active_start": 16,
+    "active_end": 24,
+    "block_enter_iteration": 5000,
+    "plateau_hits": 1,
+    "recent_loss_history": [2.31, 2.28, 2.27],
+    "last_switch_reason": "plateau",
+}
+
+"""
 def ensure_state(args=None, iteration=None):
     args = args if args is not None else get_args()
     if not is_enabled(args):
@@ -245,31 +268,26 @@ def _switch_to_next_stage(state, stages, iteration, reason):
     )
 
 
-def _unwrap_ddp(model):
+def _model_chunks(model):
+    return model if isinstance(model, list) else [model]
+
+
+def _unwrap_data_parallel(model):
     chunks = []
-    for model_chunk in model if isinstance(model, list) else [model]:
-        if isinstance(model_chunk, DDP):
+    rewrappable_wrappers = (DDP, custom_FSDP)
+    for model_chunk in _model_chunks(model):
+        if isinstance(model_chunk, rewrappable_wrappers):
             chunks.append(model_chunk.module)
         else:
             chunks.append(model_chunk)
     return chunks
 
 
-def rebuild_ddp_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None, lr_mult=1.0):
-    args = get_args()
-    if getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_custom_fsdp", False):
-        raise RuntimeError("progressive block freeze rebuild only supports Megatron DDP backend.")
+def _is_torch_fsdp2_chunk(model_chunk):
+    return HAVE_FSDP2 and isinstance(model_chunk, torch_FSDP)
 
-    timers = get_timers()
-    model = _unwrap_ddp(model)
-    apply_freeze(model, args)
 
-    for model_module in model:
-        for param in model_module.parameters():
-            set_defaults_if_not_set_tensor_model_parallel_attributes(param)
-
-    num_parameters = sum(sum(param.nelement() for param in model_module.parameters()) for model_module in model)
-    config = get_model_config(model[0])
+def _build_ddp_config(args, num_parameters):
     kwargs = {}
     for field in dataclasses.fields(DistributedDataParallelConfig):
         if hasattr(args, field.name):
@@ -278,32 +296,31 @@ def rebuild_ddp_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=
     kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
     kwargs['check_for_large_grads'] = args.check_for_large_grads
     if args.ddp_num_buckets is not None:
+        if args.ddp_bucket_size is not None:
+            raise ValueError("Cannot specify both --ddp-num-buckets and --ddp-bucket-size")
+        if args.ddp_num_buckets <= 0:
+            raise ValueError("--ddp-num-buckets must be greater than 0")
         kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
     else:
         kwargs['bucket_size'] = args.ddp_bucket_size
     kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
     kwargs['average_in_collective'] = args.ddp_average_in_collective
+    if getattr(args, "use_custom_fsdp", False) and getattr(args, "use_precision_aware_optimizer", False):
+        kwargs["preserve_fp32_weights"] = False
+
     ddp_config = DistributedDataParallelConfig(**kwargs)
-    if ddp_config.bucket_size is None:
-        ddp_config.bucket_size = max(
-            40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
-        )
-    if not ddp_config.overlap_grad_reduce:
-        ddp_config.bucket_size = None
+    if not getattr(args, "use_torch_fsdp2", False):
+        if ddp_config.bucket_size is None:
+            ddp_config.bucket_size = max(
+                40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+            )
+        if not ddp_config.overlap_grad_reduce:
+            ddp_config.bucket_size = None
+    return ddp_config
 
-    model = [
-        DDP(
-            config=config,
-            ddp_config=ddp_config,
-            module=model_chunk,
-            disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-        )
-        for model_chunk_idx, model_chunk in enumerate(model)
-    ]
-    if args.data_parallel_random_init:
-        for model_module in model:
-            model_module.broadcast_params()
 
+def _build_optimizer_scheduler(model, timers, no_wd_decay_cond=None, scale_lr_cond=None, lr_mult=1.0):
+    args = get_args()
     optim_kwargs = {}
     for field in dataclasses.fields(OptimizerConfig):
         if hasattr(args, field.name):
@@ -321,4 +338,63 @@ def rebuild_ddp_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     if getattr(args, "consumed_train_samples", 0) > 0:
         opt_param_scheduler.step(increment=args.consumed_train_samples)
+    return optimizer, opt_param_scheduler
+
+
+def rebuild_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None, lr_mult=1.0):
+    args = get_args()
+    timers = get_timers()
+
+    if getattr(args, "use_torch_fsdp2", False):
+        if not HAVE_FSDP2:
+            raise RuntimeError("Torch FSDP2 requires torch>=2.4.0.")
+        model = _model_chunks(model)
+        if not all(_is_torch_fsdp2_chunk(model_module) for model_module in model):
+            raise RuntimeError("progressive block freeze expected Torch FSDP2 wrapped model chunks.")
+        apply_freeze(model, args)
+        for model_module in model:
+            for param in model_module.parameters():
+                set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+        num_parameters = sum(sum(param.nelement() for param in model_module.parameters()) for model_module in model)
+        ddp_config = _build_ddp_config(args, num_parameters)
+        for model_module in model:
+            model_module.ddp_config = ddp_config
+        optimizer, opt_param_scheduler = _build_optimizer_scheduler(
+            model, timers, no_wd_decay_cond, scale_lr_cond, lr_mult
+        )
+        return model, optimizer, opt_param_scheduler
+
+    model = _unwrap_data_parallel(model)
+    apply_freeze(model, args)
+
+    if not getattr(args, "use_custom_fsdp", False):
+        for model_module in model:
+            for param in model_module.parameters():
+                set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
+    num_parameters = sum(sum(param.nelement() for param in model_module.parameters()) for model_module in model)
+    config = get_model_config(model[0])
+    ddp_config = _build_ddp_config(args, num_parameters)
+    DP = custom_FSDP if getattr(args, "use_custom_fsdp", False) else DDP
+
+    model = [
+        DP(
+            config=config,
+            ddp_config=ddp_config,
+            module=model_chunk,
+            disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+        )
+        for model_chunk_idx, model_chunk in enumerate(model)
+    ]
+    if args.data_parallel_random_init:
+        for model_module in model:
+            model_module.broadcast_params()
+
+    optimizer, opt_param_scheduler = _build_optimizer_scheduler(
+        model, timers, no_wd_decay_cond, scale_lr_cond, lr_mult
+    )
     return model, optimizer, opt_param_scheduler
+
+
+def rebuild_ddp_optimizer_scheduler(model, no_wd_decay_cond=None, scale_lr_cond=None, lr_mult=1.0):
+    return rebuild_optimizer_scheduler(model, no_wd_decay_cond, scale_lr_cond, lr_mult)

@@ -39,10 +39,8 @@ class ProgressiveBlockFreezeFeature(MindSpeedFeature):
     def validate_args(self, args):
         if not args.progressive_block_freeze:
             return
-        if getattr(args, "use_torch_fsdp2", False):
-            raise AssertionError('progressive-block-freeze only supports the Megatron DDP backend, not FSDP2.')
-        if getattr(args, "use_custom_fsdp", False):
-            raise AssertionError('progressive-block-freeze only supports the Megatron DDP backend, not custom FSDP.')
+        if getattr(args, "use_custom_fsdp", False) and getattr(args, "tensor_model_parallel_size", 1) > 1:
+            raise AssertionError('progressive-block-freeze with custom FSDP does not support tensor parallelism.')
         if getattr(args, "enable_high_availability", False):
             raise AssertionError('progressive-block-freeze does not support the high availability training loop.')
         if getattr(args, "lora_target_modules", None):

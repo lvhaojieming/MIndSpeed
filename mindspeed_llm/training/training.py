@@ -74,7 +74,7 @@ from mindspeed_llm.training.progressive_block_freeze import (
     apply_freeze as apply_progressive_block_freeze,
     is_enabled as is_progressive_block_freeze_enabled,
     maybe_advance as maybe_advance_progressive_block_freeze,
-    rebuild_ddp_optimizer_scheduler as rebuild_progressive_block_freeze_training_state,
+    rebuild_optimizer_scheduler as rebuild_progressive_block_freeze_training_state,
 )
 
 # The earliest we can measure the start time.

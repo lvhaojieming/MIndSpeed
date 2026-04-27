@@ -59,7 +59,7 @@ from mindspeed_llm.features_manager.finetune.finetune import FinetuneFeature
 from mindspeed_llm.features_manager.dataset.data_preprocess import DatasetPreprocessFeature
 from mindspeed_llm.features_manager.finetune.lora import LoraFeature
 from mindspeed_llm.features_manager.finetune.lu_lora import LuLoraFeature
-from mindspeed_llm.features_manager.finetune.progressive_block_freeze import ProgressiveBlockFreezeFeature
+from mindspeed_llm.features_manager.common.progressive_block_freeze import ProgressiveBlockFreezeFeature
 from mindspeed_llm.features_manager.high_availability.high_availability import HighAvailabilityFeature
 from mindspeed_llm.features_manager.inference.inference import InferenceFeature
 from mindspeed_llm.features_manager.evaluation.evaluation import EvaluationFeature
