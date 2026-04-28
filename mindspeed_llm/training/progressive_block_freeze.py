@@ -297,7 +297,8 @@ def ensure_state(args=None, iteration=None):
     if not is_enabled(args):
         return None
     if getattr(args, FREEZE_STATE_KEY, None) is None:
-        setattr(args, FREEZE_STATE_KEY, init_state(args, args.iteration if iteration is None else iteration))
+        initial_iteration = getattr(args, "iteration", 0) if iteration is None else iteration
+        setattr(args, FREEZE_STATE_KEY, init_state(args, initial_iteration))
     return getattr(args, FREEZE_STATE_KEY)
 
 

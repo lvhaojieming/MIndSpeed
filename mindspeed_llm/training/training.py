@@ -548,6 +548,7 @@ def pretrain(train_valid_test_dataset_provider,
                 if is_progressive_block_freeze_enabled(args) and hasattr(args, "progressive_block_freeze_runtime_train_state"):
                     runtime_state = args.progressive_block_freeze_runtime_train_state
                     train_args[1], train_args[2], train_args[3], train_args[7] = runtime_state
+                    delattr(args, "progressive_block_freeze_runtime_train_state")
 
             test_data_iterator = test_data_iterator_list[0]
             forward_step_func, model, optimizer, opt_param_scheduler, train_data_iterator, valid_data_iterator, process_non_loss_data_func, config = train_args

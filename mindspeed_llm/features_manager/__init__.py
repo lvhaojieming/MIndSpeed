@@ -326,6 +326,7 @@ def add_finetune_feature(features_list: List[MindSpeedFeature]):
         FinetuneFeature(),
         LoraFeature(),
         LuLoraFeature(),
+        ProgressiveBlockFreezeFeature(),
     ])
 
 

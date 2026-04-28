@@ -302,6 +302,8 @@ def save_checkpoint_wrapper(fn):
             # Record accumulated FLOPs for resume and training statistics.
             state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
             if is_progressive_block_freeze_enabled(args):
+                if hasattr(args, "progressive_block_freeze_runtime_train_state"):
+                    delattr(args, "progressive_block_freeze_runtime_train_state")
                 freeze_state = get_progressive_block_freeze_state_dict(args)
                 if freeze_state is not None:
                     state_dict[FREEZE_STATE_KEY] = freeze_state
